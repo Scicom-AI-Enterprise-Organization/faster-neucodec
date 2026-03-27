@@ -91,6 +91,91 @@ with torch.no_grad():
 torchaudio.save("reconstructed.wav", recon[0, :, :], 24_000)
 ```
 
+To run in fp16 for faster inference (decode is ~1.64× faster with no accuracy loss):
+
+```python
+model = NeuCodec.from_pretrained("neuphonic/neucodec")
+model.eval().cuda().half()  # convert to fp16; ISTFT and FSQ quantizer stay in fp32 automatically
+
+with torch.no_grad():
+    fsq_codes = model.encode_code(y)
+    recon = model.decode_code(fsq_codes).cpu()  # (B, 1, T_24), always float32
+
+torchaudio.save("reconstructed.wav", recon[0, :, :], 24_000)
+```
+
+## Benchmarks
+
+Speed and accuracy benchmarks compare `neucodec==0.0.4` (baseline) against the current release running in fp32 and fp16. `neucodec==0.0.4` is automatically installed to `/tmp` on the first run — no manual setup needed for the baseline.
+
+### Setup
+
+Install [UTMOSv2](https://github.com/Scicom-AI-Enterprise-Organization/faster-UTMOSv2) for neural MOS quality scoring:
+
+```bash
+pip3 install git+https://github.com/Scicom-AI-Enterprise-Organization/faster-UTMOSv2
+```
+
+### Accuracy benchmark
+
+Compares UTMOS (predicted MOS), MSE and SNR vs the original waveform across three variants: `v0.0.4_fp32`, `current_fp32`, `current_fp16`.
+
+```bash
+python3 benchmark_accuracy.py \
+    --audio_dir Elise_audio \
+    --num_files 100 \
+    --num_repetitions 20 \
+    --out results.csv
+```
+
+| Argument | Default | Description |
+|---|---|---|
+| `--audio_dir` | required | Directory of `.wav`/`.flac`/`.mp3`/`.ogg`/`.opus` files |
+| `--num_files` | 100 | Max files sampled from `audio_dir` |
+| `--num_repetitions` | 20 | Encode/decode calls averaged per file for timing |
+| `--out` | results.csv | Output CSV path |
+| `--model` | neuphonic/neucodec | `neuphonic/neucodec` or `neuphonic/distill-neucodec` |
+| `--device` | cuda | `cuda` or `cpu` |
+
+### Speed benchmark
+
+Reports encode latency, decode latency, and real-time factor (RTF) per variant with speedup ratios.
+
+```bash
+python3 benchmark_speed.py \
+    --audio_dir /path/to/wavs \
+    --num_files 50 \
+    --num_repetitions 20
+```
+
+Results on 50 Elise audio files, RTX 3090 Ti, 20 timing repetitions per file:
+
+**Speed**
+
+```
+────────────────────────────────────────────────────────────────────────
+  Variant           Enc ms    Dec ms    Total ms     RTF  Files
+────────────────────────────────────────────────────────────────────────
+  v0.0.4_fp32        126.7      11.9       138.7   54.39x     50
+  current_fp32       126.3      11.9       138.3   54.56x     50
+  current_fp16       119.7       7.3       127.0   60.24x     50
+────────────────────────────────────────────────────────────────────────
+  speedup v0.0.4 -> current_fp32        x1.00     x1.00       x1.00
+  speedup v0.0.4 -> current_fp16        x1.06     x1.64       x1.09
+────────────────────────────────────────────────────────────────────────
+```
+
+**Accuracy** (MSE and SNR vs original waveform, 50 files, 5 reps)
+
+```
+              mse_vs_orig  snr_db_vs_orig  encode_ms  decode_ms
+v0.0.4_fp32        0.0022          -1.501      126.6       12.1
+current_fp32       0.0022          -1.501      127.1       12.4
+current_fp16       0.0022          -1.442      118.3        7.6
+```
+
+fp16 decode is **1.64× faster** with identical MSE and a marginal +0.06 dB SNR improvement over fp32. The ISTFT layer always runs in fp32 internally for numerical correctness even when the rest of the model is fp16.
+
 ## Training Details
 
 The model was trained using the following data: 

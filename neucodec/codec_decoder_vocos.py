@@ -47,6 +47,13 @@ class ISTFT(nn.Module):
         Returns:
             Tensor: Reconstructed time-domain signal of shape (B, L), where L is the length of the output signal.
         """
+        # ISTFT must run in fp32: irfft and overlap-add require float32 precision.
+        # spec arrives as complex64 (ISTFTHead always builds S with Python `1j`
+        # which promotes to complex64 regardless of model dtype), so we just
+        # ensure the window is float32.  Audio output is always float32.
+        spec = spec.to(torch.complex64)
+        window = self.window.float()
+
         if self.padding == "center":
             # Fallback to pytorch native implementation
             return torch.istft(
@@ -54,7 +61,7 @@ class ISTFT(nn.Module):
                 self.n_fft,
                 self.hop_length,
                 self.win_length,
-                self.window,
+                window,
                 center=True,
             )
         elif self.padding == "same":
@@ -67,7 +74,7 @@ class ISTFT(nn.Module):
 
         # Inverse FFT
         ifft = torch.fft.irfft(spec, self.n_fft, dim=1, norm="backward")
-        ifft = ifft * self.window[None, :, None]
+        ifft = ifft * window[None, :, None]
 
         # Overlap and Add
         output_size = (T - 1) * self.hop_length + self.win_length
@@ -79,7 +86,7 @@ class ISTFT(nn.Module):
         )[:, 0, 0, pad:-pad]
 
         # Window envelope
-        window_sq = self.window.square().expand(1, T, -1).transpose(1, 2)
+        window_sq = window.square().expand(1, T, -1).transpose(1, 2)
         window_envelope = torch.nn.functional.fold(
             window_sq,
             output_size=(1, output_size),
@@ -91,7 +98,7 @@ class ISTFT(nn.Module):
         assert (window_envelope > 1e-11).all()
         y = y / window_envelope
 
-        return y
+        return y  # always float32
 
 
 class FourierHead(nn.Module):
@@ -372,11 +379,13 @@ class CodecDecoderVocos(nn.Module):
 
     def forward(self, x, vq=True):
         if vq is True:
-            # x, q, commit_loss = self.quantizer(x)
+            # ResidualFSQ does codebook lookups in float32 internally; run it in
+            # float32 and cast back so the rest of the half-precision path works.
+            input_dtype = x.dtype
             x = x.permute(0, 2, 1)
-            x, q = self.quantizer(x)
-            x = x.permute(0, 2, 1)
-            q = q.permute(0, 2, 1)
+            x, q = self.quantizer(x.float())
+            x = x.to(input_dtype).permute(0, 2, 1)
+            q = q.permute(0, 2, 1)  # indices — keep as Long, do not cast
             return x, q, None
         x = self.backbone(x)
         x, _ = self.head(x)

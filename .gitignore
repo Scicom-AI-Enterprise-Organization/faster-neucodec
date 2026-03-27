@@ -187,3 +187,5 @@ evals/
 *.safetensors
 *.pt
 .ruff_cache
+
+Elise_audio

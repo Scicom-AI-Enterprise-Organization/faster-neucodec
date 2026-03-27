@@ -45,6 +45,14 @@ class NeuCodec(
     def device(self):
         return next(self.parameters()).device
 
+    def half(self):
+        """Convert to fp16, but keep the FSQ quantizer in fp32.
+        ResidualFSQ does nearest-integer rounding and codebook lookups that
+        require float32; halving it causes dtype mismatches inside project_in/out."""
+        super().half()
+        self.generator.quantizer.float()
+        return self
+
     @classmethod
     def _from_pretrained(
         cls,
@@ -135,6 +143,7 @@ class NeuCodec(
         
         return y
         
+    @torch.inference_mode()
     def encode_code(self, audio_or_path: torch.Tensor | Path | str) -> torch.Tensor:
         """
         Args:
@@ -143,29 +152,25 @@ class NeuCodec(
         Returns:
             fsq_codes: torch.Tensor [B, 1, F], 50hz FSQ codes
         """
-         
+
         # prepare inputs
-        y = self._prepare_audio(audio_or_path)  
-        all_semantic_features = []
-        for i in range(y.size(0)):
-            semantic_features = (
-                self.feature_extractor(
-                    y[i, :].cpu(),
-                    sampling_rate=16_000,
-                    return_tensors="pt",
-                )
-                .input_features.to(self.device)
-            )
-            all_semantic_features.append(semantic_features)
-        semantic_features = torch.vstack(all_semantic_features)
-       
-        # acoustic encoding
-        acoustic_emb = self.CodecEnc(y.to(self.device))
+        y = self._prepare_audio(audio_or_path)
+        model_dtype = next(self.CodecEnc.parameters()).dtype
+
+        # feature extractor always needs float32 audio (numpy arrays)
+        semantic_features = self.feature_extractor(
+            [y[i, 0].float().cpu().numpy() for i in range(y.size(0))],
+            sampling_rate=16_000,
+            return_tensors="pt",
+        ).input_features.to(self.device, dtype=model_dtype)
+
+        # acoustic encoding (cast audio to model dtype)
+        acoustic_emb = self.CodecEnc(y.to(self.device, dtype=model_dtype))
         acoustic_emb = acoustic_emb.transpose(1, 2)
 
         # semantic encoding
         semantic_output = (
-            self.semantic_model(semantic_features[:]).hidden_states[16].transpose(1, 2)
+            self.semantic_model(semantic_features).hidden_states[16].transpose(1, 2)
         )
         semantic_encoded = self.SemanticEncoder_module(semantic_output)
 
@@ -173,7 +178,7 @@ class NeuCodec(
         if acoustic_emb.shape[-1] != semantic_encoded.shape[-1]:
             min_len = min(acoustic_emb.shape[-1], semantic_encoded.shape[-1])
             acoustic_emb = acoustic_emb[:, :, :min_len]
-            semantic_encoded = semantic_encoded[:, :, :min_len]        
+            semantic_encoded = semantic_encoded[:, :, :min_len]
         concat_emb = torch.cat([semantic_encoded, acoustic_emb], dim=1)
         concat_emb = self.fc_prior(concat_emb.transpose(1, 2)).transpose(1, 2)
 
@@ -181,6 +186,7 @@ class NeuCodec(
         _, fsq_codes, _ = self.generator(concat_emb, vq=True)
         return fsq_codes
 
+    @torch.inference_mode()
     def decode_code(self, fsq_codes: torch.Tensor) -> torch.Tensor:
         """
         Args:
@@ -190,9 +196,10 @@ class NeuCodec(
             recon: torch.Tensor [B, 1, T], reconstructed 24kHz audio
         """
 
+        model_dtype = next(self.fc_post_a.parameters()).dtype
         fsq_post_emb = self.generator.quantizer.get_output_from_indices(fsq_codes.transpose(1, 2))
-        fsq_post_emb = fsq_post_emb.transpose(1, 2)
-        fsq_post_emb = self.fc_post_a(fsq_post_emb.transpose(1, 2)).transpose(1, 2) 
+        fsq_post_emb = fsq_post_emb.to(model_dtype).transpose(1, 2)
+        fsq_post_emb = self.fc_post_a(fsq_post_emb.transpose(1, 2)).transpose(1, 2)
         recon = self.generator(fsq_post_emb.transpose(1, 2), vq=False)[0]
         return recon
     
@@ -219,7 +226,8 @@ class DistillNeuCodec(NeuCodec):
         self.fc_sq_prior = nn.Linear(512, 768)
         self.fc_post_a = nn.Linear(2048, 1024)
         
-    def encode_code(self, audio_or_path:  torch.Tensor | Path | str) -> torch.Tensor:
+    @torch.inference_mode()
+    def encode_code(self, audio_or_path: torch.Tensor | Path | str) -> torch.Tensor:
         """
         Args:
             audio_or_path: torch.Tensor [B, 1, T] | Path | str, input audio
@@ -227,26 +235,20 @@ class DistillNeuCodec(NeuCodec):
         Returns:
             fsq_codes: torch.Tensor [B, 1, F], 50hz FSQ codes
         """
-         
+
         # prepare inputs
         y = self._prepare_audio(audio_or_path)
-        
-        all_semantic_features = []
-        for i in range(y.size(0)):
-            semantic_features = (
-                self.feature_extractor(
-                    F.pad(y[i, :].cpu(), (160, 160)),
-                    sampling_rate=16_000,
-                    return_tensors="pt",
-                )
-                .input_values.to(self.device)
-                .squeeze(0)
-            )
-            all_semantic_features.append(semantic_features)
-        semantic_features = torch.vstack(all_semantic_features)
-    
-        # acoustic encoding
-        fsq_emb = self.fc_sq_prior(self.codec_encoder(y.to(self.device)))
+        model_dtype = next(self.codec_encoder.parameters()).dtype
+
+        # feature extractor always needs float32 audio (numpy arrays)
+        semantic_features = self.feature_extractor(
+            [F.pad(y[i, :], (160, 160)).squeeze(0).float().cpu().numpy() for i in range(y.size(0))],
+            sampling_rate=16_000,
+            return_tensors="pt",
+        ).input_values.to(self.device, dtype=model_dtype)
+
+        # acoustic encoding (cast audio to model dtype)
+        fsq_emb = self.fc_sq_prior(self.codec_encoder(y.to(self.device, dtype=model_dtype)))
         fsq_emb = fsq_emb.transpose(1, 2)
 
         # semantic encoding
